@@ -232,7 +232,7 @@ async def start_exercise(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_weight = await db.get_weight(user_id, day, ex["id"])
 
     equipment = context.user_data["equipment"]
-    available = equipment[ex["eq_id"]]
+    available = equipment[ex["eq_id"]]["available_weights"]
 
     context.user_data.update({
         "current_exercise":      ex,
@@ -279,7 +279,14 @@ async def weight_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "cancel_workout":
-        await query.edit_message_text("❌ Тренировка отменена.")
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏋️ Начать новую тренировку", callback_data="go_start")]
+        ])
+        await query.edit_message_text(
+            "❌ Тренировка отменена.\n\n"
+            "📊 Выполненные упражнения сохранены.",
+            reply_markup=keyboard
+        )
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -314,7 +321,14 @@ async def reps_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "cancel_workout":
-        await query.edit_message_text("❌ Тренировка отменена.")
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏋️ Начать новую тренировку", callback_data="go_start")]
+        ])
+        await query.edit_message_text(
+            "❌ Тренировка отменена.\n\n"
+            "📊 Выполненные упражнения сохранены.",
+            reply_markup=keyboard
+        )
         context.user_data.clear()
         return ConversationHandler.END
 

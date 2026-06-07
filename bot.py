@@ -159,7 +159,7 @@ def reps_keyboard(set_num: int) -> InlineKeyboardMarkup:
 
 
 async def build_month_history(user_id: int) -> str:
-    sessions = await db.get_month_sessions(user_id)
+    sessions = await db.get_month_session(user_id)
     if not sessions:
         return "📅 В этом месяце тренировок ещё не было."
     lines = ["📅 <b>Тренировки в этом месяце:</b>"]
@@ -477,6 +477,21 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application: Application):
     await db.init_db()
     print("✅ БД инициализирована")
+
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Логирует все необработанные исключения."""
+    import traceback
+    tb = "".join(traceback.format_exception(
+        type(context.error), context.error, context.error.__traceback__
+    ))
+    print(f"❌ Необработанная ошибка:\n{tb}")
+    if isinstance(update, Update) and update.effective_chat:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="⚠️ Произошла внутренняя ошибка. Попробуйте /start"
+        )
 
 
 def main():

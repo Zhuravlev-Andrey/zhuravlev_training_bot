@@ -1,1 +1,28 @@
+# Переменные окружения — никогда не коммитить
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Виртуальные окружения
+venv/
+.venv/
+env/
+
+# Тесты и покрытие
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
 .DS_Store
+Thumbs.db

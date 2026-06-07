@@ -31,6 +31,11 @@ from telegram.ext import (
 )
 
 import db
+from config import (
+    DEFAULT_SETS, DEFAULT_REPS, DEFAULT_REST_S,
+    MIN_SETS_FOR_PROGRESS, REPS_MIN, REPS_MAX,
+    WEIGHT_KEYBOARD_RANGE, DEFAULT_TZ,
+)
 
 # ============================================================
 # НАСТРОЙКИ
@@ -40,7 +45,7 @@ TOKEN = os.environ.get("TOKEN")
 if not TOKEN:
     raise RuntimeError("❌ TOKEN не задан")
 
-TZ = ZoneInfo(os.environ.get("TZ", "Europe/Moscow"))
+TZ = ZoneInfo(os.environ.get("TZ", DEFAULT_TZ))
 
 # ============================================================
 # СОСТОЯНИЯ FSM
@@ -128,8 +133,8 @@ def weight_keyboard(available: list[float], current: float,
         idx = available.index(current)
     except ValueError:
         idx = 0
-    start = max(0, idx - 4)
-    end = min(len(available), idx + 5)
+    start = max(0, idx - WEIGHT_KEYBOARD_RANGE)
+    end = min(len(available), idx + WEIGHT_KEYBOARD_RANGE + 1)
     subset = available[start:end]
     keyboard = []
     row = []
@@ -170,7 +175,7 @@ def all_weights_keyboard(available: list[float],
 def reps_keyboard(target: int, set_num: int) -> InlineKeyboardMarkup:
     keyboard = []
     row = []
-    for r in range(1, 13):
+    for r in range(REPS_MIN, REPS_MAX + 1):
         label = f"{'→ ' if r == target else ''}{r}"
         row.append(InlineKeyboardButton(label, callback_data=f"r_{r}_{set_num}"))
         if len(row) == 4:
@@ -696,7 +701,7 @@ async def finish_exercise(update: Update, context: ContextTypes.DEFAULT_TYPE):
     use_progress = context.user_data["use_progress"]
 
     # Прогрессия только если включена для тренировки И есть хотя бы 4 подхода
-    if use_progress and len(sets_data) >= 4 and available:
+    if use_progress and len(sets_data) >= MIN_SETS_FOR_PROGRESS and available:
         set3_reps = sets_data[2]["reps"]
         set4_reps = sets_data[3]["reps"]
         set4_weight = sets_data[3]["weight_kg"]

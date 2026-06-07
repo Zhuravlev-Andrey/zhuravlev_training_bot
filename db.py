@@ -14,6 +14,7 @@ db.py — слой данных, PostgreSQL через asyncpg.
 
 import os
 import asyncpg
+from config import INITIAL_EQUIPMENT, DB_POOL_MIN_DEFAULT, DB_POOL_MAX_DEFAULT
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "").replace("postgres://", "postgresql://", 1)
 if not DATABASE_URL:
@@ -26,8 +27,8 @@ async def get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
         # min_size/max_size вынесены в env — легко менять без деплоя
-        min_size = int(os.environ.get("DB_POOL_MIN", "1"))
-        max_size = int(os.environ.get("DB_POOL_MAX", "10"))
+        min_size = int(os.environ.get("DB_POOL_MIN", str(DB_POOL_MIN_DEFAULT)))
+        max_size = int(os.environ.get("DB_POOL_MAX", str(DB_POOL_MAX_DEFAULT)))
         _pool = await asyncpg.create_pool(DATABASE_URL, min_size=min_size, max_size=max_size)
     return _pool
 
@@ -35,14 +36,6 @@ async def get_pool() -> asyncpg.Pool:
 # ============================================================
 # НАЧАЛЬНЫЕ ДАННЫЕ
 # ============================================================
-
-INITIAL_EQUIPMENT: list[tuple[str, str, list[float]]] = [
-    ("smith_machine",   "Тренажер Смита",               [20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100]),
-    ("dumbbells",       "Гантели",                       [2,4,6,8,10,12,14,16,18,20,22,24,26,28,30]),
-    ("cable_machine",   "Блочный тренажер",              [9,11,13,15,17,19,21,23,25,27,29,31,33,35,37,39,41,43,45,47,49,51,53,55,57,59]),
-    ("leg_press",       "Горизонтальная платформа",      [45,62,72,81,90,99,108,117,126,135,144,153,162,171,180,189,198]),
-    ("shoulder_machine","Тренажер для плеч (махи)",      [14,16,18,20,23,26,29,32,35,38,41,44,47,50,53,56,59,62,65,68,71,74,77,80]),
-]
 
 
 # ============================================================

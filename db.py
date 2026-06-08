@@ -430,6 +430,26 @@ async def delete_schedule_entry(user_id: int, template_id: int, weekday: int | N
 # ЭКСПОРТ
 # ============================================================
 
+
+async def get_existing_weight(user_id: int, exercise_id: int) -> float | None:
+    """Возвращает сохранённый вес или None если записи ещё нет."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT weight_kg FROM training_weight WHERE user_id=$1 AND exercise_id=$2",
+            user_id, exercise_id
+        )
+        return float(row["weight_kg"]) if row else None
+
+
+async def delete_workout_template(template_id: int):
+    """Удаляет шаблон тренировки каскадно."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM workout_template WHERE id=$1", template_id
+        )
+
 async def export_user_data(user_id: int) -> dict:
     """Полный экспорт данных пользователя в dict (→ JSON или CSV)."""
     pool = await get_pool()

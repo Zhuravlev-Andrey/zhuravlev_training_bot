@@ -2,9 +2,7 @@
 bot.py — Telegram-бот для силовых тренировок.
 """
 
-import csv
-import io
-import json
+import asyncio
 import os
 import traceback
 from zoneinfo import ZoneInfo
@@ -66,9 +64,10 @@ TZ = ZoneInfo(os.environ.get("TZ", DEFAULT_TZ))
     WRK_REPS,
     WRK_REST,
     WRK_CONFIRM_CHANGE,
-) = range(11, 16)
-
-EXPORT_FORMAT = 16
+    WRK_FIRST_WEIGHT,   # запрос стартового веса при первой тренировке
+    EDIT_SELECT,        # выбор тренировки для редактирования
+    EDIT_MENU,          # меню действий с тренировкой
+) = range(11, 19)
 
 # ============================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -115,6 +114,41 @@ def yn_keyboard(yes_data: str, no_data: str) -> InlineKeyboardMarkup:
     ]])
 
 
+def sets_keyboard(default: int) -> InlineKeyboardMarkup:
+    """Кнопки 1–10 для выбора количества подходов."""
+    row1 = [InlineKeyboardButton(
+        f"{'→ ' if i == default else ''}{i}", callback_data=f"sets_{i}"
+    ) for i in range(1, 6)]
+    row2 = [InlineKeyboardButton(
+        f"{'→ ' if i == default else ''}{i}", callback_data=f"sets_{i}"
+    ) for i in range(6, 11)]
+    return InlineKeyboardMarkup([row1, row2])
+
+
+def reps_setup_keyboard(default: int) -> InlineKeyboardMarkup:
+    """Кнопки 1–20 для выбора количества повторений при создании."""
+    rows = []
+    row = []
+    for i in range(1, 21):
+        label = f"→ {i}" if i == default else str(i)
+        row.append(InlineKeyboardButton(label, callback_data=f"reps_{i}"))
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def rest_keyboard(default: int) -> InlineKeyboardMarkup:
+    """Кнопки быстрого выбора времени отдыха."""
+    presets = [30, 60, 90, 120]
+    row = [InlineKeyboardButton(
+        f"{'→ ' if s == default else ''}{s} сек", callback_data=f"rest_{s}"
+    ) for s in presets]
+    return InlineKeyboardMarkup([row])
+
+
 def weight_keyboard(available: list[float], recommended: float,
                     set_num: int, target_reps: int) -> InlineKeyboardMarkup:
     try:
@@ -134,8 +168,10 @@ def weight_keyboard(available: list[float], recommended: float,
             row = []
     if row:
         keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("📋 Все веса", callback_data=f"wall_{set_num}_{target_reps}")])
-    keyboard.append([InlineKeyboardButton("❌ Отменить тренировку", callback_data="cancel_workout")])
+    keyboard.append([InlineKeyboardButton(
+        "📋 Все веса", callback_data=f"wall_{set_num}_{target_reps}")])
+    keyboard.append([InlineKeyboardButton(
+        "❌ Отменить тренировку", callback_data="cancel_workout")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -150,7 +186,8 @@ def all_weights_keyboard(available: list[float],
             row = []
     if row:
         keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("❌ Отменить тренировку", callback_data="cancel_workout")])
+    keyboard.append([InlineKeyboardButton(
+        "❌ Отменить тренировку", callback_data="cancel_workout")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -165,7 +202,8 @@ def reps_keyboard(target: int, set_num: int) -> InlineKeyboardMarkup:
             row = []
     if row:
         keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("❌ Отменить тренировку", callback_data="cancel_workout")])
+    keyboard.append([InlineKeyboardButton(
+        "❌ Отменить тренировку", callback_data="cancel_workout")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -212,15 +250,94 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                    ]]))
         return WRK_SELECT
 
+    # Кнопки тренировок
     buttons = [[InlineKeyboardButton(t["name"], callback_data=f"tmpl_{t['id']}")]
                for t in templates]
-    buttons.append([InlineKeyboardButton("➕ Создать новую тренировку", callback_data="new_workout")])
-    buttons.append([InlineKeyboardButton("📤 Экспорт данных", callback_data="export")])
+    buttons.append([
+        InlineKeyboardButton("➕ Создать тренировку", callback_data="new_workout"),
+        InlineKeyboardButton("✏️ Редактировать", callback_data="edit_workout"),
+    ])
 
     await send(update, context,
                f"{history}\n\nВыберите тренировку:",
                reply_markup=InlineKeyboardMarkup(buttons))
     return WRK_SELECT
+
+
+# ============================================================
+# РЕДАКТИРОВАНИЕ ТРЕНИРОВКИ (п.8)
+# ============================================================
+
+async def edit_workout_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    templates = await db.get_user_workout_templates(user_id)
+    buttons = [[InlineKeyboardButton(t["name"], callback_data=f"edit_{t['id']}")]
+               for t in templates]
+    buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="go_start")])
+    await query.message.reply_text(
+        "Выберите тренировку для редактирования:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return EDIT_SELECT
+
+
+async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    template_id = int(query.data.split("_")[1])
+    user_id = update.effective_user.id
+    template = await db.get_workout_template(template_id, user_id)
+    if not template:
+        await query.message.reply_text("⚠️ Тренировка не найдена.")
+        return EDIT_SELECT
+
+    exercises = await db.get_exercise_templates(template_id)
+    ex_list = "\n".join(
+        f"{i}. {e['name']}" for i, e in enumerate(exercises, 1)
+    ) or "нет упражнений"
+
+    context.user_data["edit_template_id"] = template_id
+
+    await query.message.reply_text(
+        f"✏️ <b>{template['name']}</b>\n\n"
+        f"Упражнения:\n{ex_list}\n\n"
+        f"Прогрессия: {'включена ✅' if template['use_weight_progress'] else 'выключена ❌'}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Добавить упражнение", callback_data="edit_add_ex")],
+            [InlineKeyboardButton("🗑 Удалить тренировку", callback_data="edit_delete")],
+            [InlineKeyboardButton("↩️ Назад", callback_data="go_start")],
+        ])
+    )
+    return EDIT_MENU
+
+
+async def edit_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "go_start":
+        return await start(update, context)
+
+    if query.data == "edit_add_ex":
+        # Переходим в флоу создания упражнения с возвратом в редактирование
+        context.user_data["new_wt"] = {
+            "exercises": [],
+            "edit_mode": True,
+            "template_id": context.user_data["edit_template_id"],
+        }
+        await query.message.reply_text("Введите название упражнения:")
+        return CRT_EX_NAME
+
+    if query.data == "edit_delete":
+        template_id = context.user_data["edit_template_id"]
+        await db.delete_workout_template(template_id)
+        await query.message.reply_text("🗑 Тренировка удалена.")
+        return await start(update, context)
+
+    return EDIT_MENU
 
 
 # ============================================================
@@ -242,10 +359,18 @@ async def crt_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Название не может быть пустым. Попробуйте снова:")
         return CRT_NAME
     context.user_data["new_wt"]["name"] = name
+
+    # п.2 — подробное описание прогрессии
     await update.message.reply_text(
         f"Тренировка «<b>{name}</b>»\n\n"
-        "Включить автоматическую прогрессию весов?\n"
-        "(бот будет повышать/снижать вес по результатам подходов)",
+        "Включить автоматическую <b>прогрессию весов</b>?\n\n"
+        "Как это работает:\n"
+        "• После каждого упражнения бот анализирует результаты\n"
+        "• Если в 3-м подходе вы сделали <b>меньше 10 повторений</b> — на следующей тренировке вес будет <b>снижен</b> на одну ступень\n"
+        "• Если в последнем подходе вы сделали <b>10 повторений с рабочим весом</b> — вес будет <b>повышен</b> на одну ступень\n"
+        "• Во всех остальных случаях вес остаётся прежним\n\n"
+        "Ступени определяются доступными весами тренажёра (например: 20→25→30 кг).\n"
+        "Изменение веса требует вашего подтверждения.",
         parse_mode="HTML",
         reply_markup=yn_keyboard("prog_yes", "prog_no")
     )
@@ -298,9 +423,10 @@ async def crt_ex_equip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["new_ex"]["equipment_id"] = eq_id
         context.user_data["new_ex"]["available_weight"] = list(eq["available_weight"])
 
+    # п.3 — кнопки для подходов
     await query.message.reply_text(
-        f"Сколько подходов? (по умолчанию {DEFAULT_SETS})\n"
-        "Введите число или отправьте пустое сообщение:"
+        f"Сколько подходов?\n(по умолчанию {DEFAULT_SETS}, можно ввести вручную)",
+        reply_markup=sets_keyboard(DEFAULT_SETS)
     )
     return CRT_EX_SETS
 
@@ -330,75 +456,171 @@ async def crt_ex_equip_new_weights(update: Update, context: ContextTypes.DEFAULT
 
     await update.message.reply_text(
         f"✅ Тренажёр «{context.user_data['new_eq_name']}» создан.\n\n"
-        f"Сколько подходов? (по умолчанию {DEFAULT_SETS}):"
+        f"Сколько подходов? (по умолчанию {DEFAULT_SETS})",
+        reply_markup=sets_keyboard(DEFAULT_SETS)
     )
     return CRT_EX_SETS
 
 
-async def crt_ex_sets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    try:
-        sets = int(text) if text else DEFAULT_SETS
-        if sets < 1 or sets > 10:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Введите число от 1 до 10:")
-        return CRT_EX_SETS
+async def crt_ex_sets_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопок выбора подходов."""
+    query = update.callback_query
+    await query.answer()
+    sets = int(query.data.split("_")[1])
     context.user_data["new_ex"]["sets"] = sets
-    await update.message.reply_text(
-        f"Сколько повторений в каждом подходе? (по умолчанию {DEFAULT_REPS})\n"
-        "Можно будет переопределить для отдельных подходов позже:"
+    await query.message.reply_text(
+        f"✅ Подходов: {sets}\n\n"
+        f"Сколько повторений в каждом подходе?\n(по умолчанию {DEFAULT_REPS})",
+        reply_markup=reps_setup_keyboard(DEFAULT_REPS)
     )
     return CRT_EX_REPS
 
 
-async def crt_ex_reps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def crt_ex_sets_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ручного ввода подходов."""
     text = update.message.text.strip()
     try:
-        reps = int(text) if text else DEFAULT_REPS
-        if reps < 1 or reps > 50:
+        sets = int(text)
+        if sets < 1 or sets > 10:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Введите число от 1 до 50:")
-        return CRT_EX_REPS
-    context.user_data["new_ex"]["reps"] = reps
+        await update.message.reply_text(
+            "Введите число от 1 до 10 или выберите кнопкой:",
+            reply_markup=sets_keyboard(DEFAULT_SETS)
+        )
+        return CRT_EX_SETS
+    context.user_data["new_ex"]["sets"] = sets
     await update.message.reply_text(
-        f"Время отдыха между подходами в секундах? (по умолчанию {DEFAULT_REST_S})\n"
-        "Например: 60, 90, 120:"
+        f"✅ Подходов: {sets}\n\n"
+        f"Сколько повторений в каждом подходе?\n(по умолчанию {DEFAULT_REPS})",
+        reply_markup=reps_setup_keyboard(DEFAULT_REPS)
+    )
+    return CRT_EX_REPS
+
+
+async def crt_ex_reps_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопок выбора повторений."""
+    query = update.callback_query
+    await query.answer()
+    reps = int(query.data.split("_")[1])
+    context.user_data["new_ex"]["reps"] = reps
+    await query.message.reply_text(
+        f"✅ Повторений: {reps}\n\n"
+        "Время отдыха между подходами:",
+        reply_markup=rest_keyboard(DEFAULT_REST_S)
     )
     return CRT_EX_REST
 
 
-async def crt_ex_rest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def crt_ex_reps_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ручного ввода повторений."""
     text = update.message.text.strip()
     try:
-        rest = int(text) if text else DEFAULT_REST_S
+        reps = int(text)
+        if reps < 1 or reps > 50:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "Введите число от 1 до 50 или выберите кнопкой:",
+            reply_markup=reps_setup_keyboard(DEFAULT_REPS)
+        )
+        return CRT_EX_REPS
+    context.user_data["new_ex"]["reps"] = reps
+    await update.message.reply_text(
+        f"✅ Повторений: {reps}\n\nВремя отдыха между подходами:",
+        reply_markup=rest_keyboard(DEFAULT_REST_S)
+    )
+    return CRT_EX_REST
+
+
+async def crt_ex_rest_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопок выбора отдыха."""
+    query = update.callback_query
+    await query.answer()
+    rest = int(query.data.split("_")[1])
+    context.user_data["new_ex"]["rest"] = rest
+    # п.6 — кнопка «Пропустить» для комментария
+    await query.message.reply_text(
+        f"✅ Отдых: {rest} сек\n\n"
+        "Комментарий к упражнению (необязательно).\n"
+        "Например: «держать спину прямо»",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⏭ Пропустить", callback_data="comment_skip")
+        ]])
+    )
+    return CRT_EX_COMMENT
+
+
+async def crt_ex_rest_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ручного ввода времени отдыха."""
+    text = update.message.text.strip()
+    try:
+        rest = int(text)
         if rest < 0 or rest > 600:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Введите число от 0 до 600 секунд:")
+        await update.message.reply_text(
+            "Введите число от 0 до 600 секунд или выберите кнопкой:",
+            reply_markup=rest_keyboard(DEFAULT_REST_S)
+        )
         return CRT_EX_REST
     context.user_data["new_ex"]["rest"] = rest
     await update.message.reply_text(
-        "Комментарий к упражнению (необязательно).\n"
-        "Например: «держать спину прямо»\n"
-        "Или отправьте /skip чтобы пропустить."
+        f"✅ Отдых: {rest} сек\n\nКомментарий к упражнению (необязательно):",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⏭ Пропустить", callback_data="comment_skip")
+        ]])
     )
     return CRT_EX_COMMENT
 
 
 async def crt_ex_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик текстового комментария."""
     text = update.message.text.strip()
-    context.user_data["new_ex"]["comment"] = None if text == "/skip" else text
-    context.user_data["new_wt"]["exercises"].append(context.user_data.pop("new_ex"))
-    n = len(context.user_data["new_wt"]["exercises"])
-    await update.message.reply_text(
-        f"✅ Упражнение {n} добавлено.",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("➕ Ещё упражнение", callback_data="ex_more"),
-            InlineKeyboardButton("✅ Завершить", callback_data="ex_done"),
-        ]])
-    )
+    context.user_data["new_ex"]["comment"] = text
+    return await _finish_exercise_creation(update, context)
+
+
+async def crt_ex_comment_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «Пропустить» комментарий."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data["new_ex"]["comment"] = None
+    return await _finish_exercise_creation(update, context)
+
+
+async def _finish_exercise_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wt = context.user_data["new_wt"]
+    wt["exercises"].append(context.user_data.pop("new_ex"))
+    n = len(wt["exercises"])
+
+    # Режим редактирования — сразу сохраняем упражнение в существующий шаблон
+    if wt.get("edit_mode"):
+        ex = wt["exercises"][-1]
+        await db.create_exercise_template(
+            workout_id=wt["template_id"],
+            equipment_id=ex.get("equipment_id"),
+            name=ex["name"],
+            order_index=n,
+            default_sets=ex["sets"],
+            default_reps=ex["reps"],
+            default_rest_s=ex["rest"],
+            comment=ex.get("comment"),
+        )
+        await send(update, context,
+                   f"✅ Упражнение «{ex['name']}» добавлено в тренировку.",
+                   reply_markup=InlineKeyboardMarkup([[
+                       InlineKeyboardButton("↩️ На главную", callback_data="go_start")
+                   ]]))
+        context.user_data.pop("new_wt", None)
+        return WRK_SELECT
+
+    await send(update, context,
+               f"✅ Упражнение {n} добавлено.",
+               reply_markup=InlineKeyboardMarkup([[
+                   InlineKeyboardButton("➕ Ещё упражнение", callback_data="ex_more"),
+                   InlineKeyboardButton("✅ Завершить", callback_data="ex_done"),
+               ]]))
     return CRT_EX_MORE
 
 
@@ -454,8 +676,8 @@ async def select_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await start(update, context)
     if query.data == "new_workout":
         return await new_workout_start(update, context)
-    if query.data == "export":
-        return await export_start(update, context)
+    if query.data == "edit_workout":
+        return await edit_workout_list(update, context)
 
     template_id = int(query.data.split("_")[1])
     user_id = update.effective_user.id
@@ -501,13 +723,14 @@ async def start_exercise(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_overrides_raw = await db.get_set_templates(ex["id"])
     set_overrides = {r["set_number"]: dict(r) for r in set_overrides_raw}
 
-    current_weight = await db.get_weight(user_id, ex["id"], 0.0)
+    # п.7 — проверяем есть ли уже сохранённый вес
+    existing_weight = await db.get_existing_weight(user_id, ex["id"])
 
     context.user_data.update({
         "current_exercise": ex,
         "available":        available,
         "set_overrides":    set_overrides,
-        "current_weight":   current_weight,
+        "current_weight":   existing_weight or 0.0,
         "current_sets":     [],
         "current_set_num":  1,
     })
@@ -521,11 +744,55 @@ async def start_exercise(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dt = last["started_at"].astimezone(TZ).strftime("%d.%m.%Y")
         last_str = f"\n📅 Последнее: {dt}"
 
+    if existing_weight is None:
+        # Первая тренировка — спрашиваем стартовый вес
+        await send(update, context,
+                   f"📋 <b>Упражнение {idx + 1}/{total}: {ex['name']}</b>"
+                   f"{comment_str}\n\n"
+                   "Это ваше первое выполнение этого упражнения.\n"
+                   f"Выберите <b>стартовый рабочий вес</b>:" +
+                   ("\n\nДоступные веса тренажёра:" if available else "\n\nВведите вес вручную (кг):"),
+                   reply_markup=all_weights_keyboard(available, 0, 0) if available else None)
+        return WRK_FIRST_WEIGHT
+
     await send(update, context,
                f"📋 <b>Упражнение {idx + 1}/{total}: {ex['name']}</b>"
                f"{comment_str}{last_str}\n"
-               f"🎯 Рабочий вес: <b>{current_weight} кг</b>")
+               f"🎯 Рабочий вес: <b>{existing_weight} кг</b>")
+    return await ask_weight(update, context)
 
+
+async def first_weight_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик выбора стартового веса (кнопка или текст)."""
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        if query.data == "cancel_workout":
+            return await cancel_workout(update, context)
+        parts = query.data.split("_")
+        try:
+            weight = float(parts[1])
+        except (IndexError, ValueError):
+            await query.message.reply_text("⚠️ Ошибка, попробуйте снова.")
+            return WRK_FIRST_WEIGHT
+    else:
+        try:
+            weight = float(update.message.text.replace(",", "."))
+        except ValueError:
+            await update.message.reply_text("Введите число (например: 20 или 22.5):")
+            return WRK_FIRST_WEIGHT
+
+    ex = context.user_data["current_exercise"]
+    user_id = context.user_data["user_id"]
+    await db.set_weight(user_id, ex["id"], weight)
+    context.user_data["current_weight"] = weight
+
+    total = len(context.user_data["exercises"])
+    idx = context.user_data["exercise_index"]
+    await send(update, context,
+               f"✅ Стартовый вес сохранён: <b>{weight} кг</b>\n\n"
+               f"📋 <b>Упражнение {idx + 1}/{total}: {ex['name']}</b>\n"
+               f"🎯 Рабочий вес: <b>{weight} кг</b>")
     return await ask_weight(update, context)
 
 
@@ -540,17 +807,16 @@ async def ask_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["temp_target_reps"] = target_reps
     context.user_data["temp_rest_s"] = rest_s
 
-    pct_label = f"{int(weight_pct * 100)}%" if weight_pct != 1.0 else "100% (рабочий)"
-
     if not available:
         await send(update, context,
-                   f"<b>Подход {set_num}</b> — цель: {target_reps} повт., {pct_label}\n"
+                   f"<b>Подход {set_num}</b> — цель: {target_reps} повт.\n"
                    f"Введите вес (кг):")
         return WRK_WEIGHT
 
     recommended = get_closest_weight(available, current * weight_pct)
+    pct_label = f"~{int(weight_pct * 100)}% от рабочего" if weight_pct != 1.0 else "рабочий вес"
     await send(update, context,
-               f"<b>Подход {set_num}</b> — цель: {target_reps} повт., {pct_label}\n"
+               f"<b>Подход {set_num}</b> — цель: {target_reps} повт. ({pct_label})\n"
                f"💡 Рекомендуемый вес: <b>{recommended} кг</b>",
                reply_markup=weight_keyboard(available, recommended, set_num, target_reps))
     return WRK_WEIGHT
@@ -642,19 +908,89 @@ async def reps_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["current_set_num"] = set_num + 1
         mins, secs = divmod(rest_s, 60)
         time_str = f"{mins}:{secs:02d}" if mins else f"{secs} сек"
-        await send(update, context,
-                   f"⏱ Отдых: <b>{time_str}</b>",
-                   reply_markup=InlineKeyboardMarkup([[
-                       InlineKeyboardButton("⏭ Пропустить", callback_data="skip_rest")
-                   ]]))
+
+        rest_msg = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"⏱ Отдых: <b>{time_str}</b>\nСледующий подход начнётся автоматически.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⏭ Пропустить", callback_data="skip_rest")
+            ]])
+        )
+        # п.9 — автопереход после таймера
+        context.user_data["rest_msg_id"] = rest_msg.message_id
+        context.job_queue.run_once(
+            rest_timer_done,
+            rest_s,
+            chat_id=update.effective_chat.id,
+            name=f"rest_{update.effective_chat.id}",
+            data={"context_data": dict(context.user_data)},
+        )
         return WRK_REST
     else:
         return await finish_exercise(update, context)
 
 
+async def rest_timer_done(context: ContextTypes.DEFAULT_TYPE):
+    """Автопереход после истечения таймера отдыха."""
+    job = context.job
+    chat_id = job.chat_id
+
+    # Удаляем сообщение с таймером
+    msg_id = job.data["context_data"].get("rest_msg_id")
+    if msg_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except Exception:
+            pass
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="⏱ Отдых завершён! Приступайте к следующему подходу.",
+        parse_mode="HTML"
+    )
+
+    # Восстанавливаем user_data и вызываем ask_weight через фиктивный update
+    # Передаём управление через отдельное сообщение — пользователь нажмёт кнопку веса
+    # Отправляем клавиатуру весов напрямую
+    data = job.data["context_data"]
+    ex = data.get("current_exercise", {})
+    available = data.get("available", [])
+    set_num = data.get("current_set_num", 1)
+    current = data.get("current_weight", 0.0)
+    set_overrides = data.get("set_overrides", {})
+
+    ov = set_overrides.get(set_num, {})
+    target_reps = ov.get("reps") or ex.get("default_reps", 10)
+    weight_pct = ov.get("weight_pct") or 1.0
+
+    if available:
+        recommended = get_closest_weight(available, current * weight_pct)
+        pct_label = f"~{int(weight_pct * 100)}% от рабочего" if weight_pct != 1.0 else "рабочий вес"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"<b>Подход {set_num}</b> — цель: {target_reps} повт. ({pct_label})\n"
+                 f"💡 Рекомендуемый вес: <b>{recommended} кг</b>",
+            parse_mode="HTML",
+            reply_markup=weight_keyboard(available, recommended, set_num, target_reps)
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"<b>Подход {set_num}</b> — цель: {target_reps} повт.\nВведите вес (кг):",
+            parse_mode="HTML"
+        )
+
+
 async def skip_rest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    # Отменяем таймер если он запущен
+    jobs = context.job_queue.get_jobs_by_name(f"rest_{update.effective_chat.id}")
+    for job in jobs:
+        job.schedule_removal()
+
     await query.edit_message_text("⏭ Отдых пропущен.")
     return await ask_weight(update, context)
 
@@ -741,68 +1077,29 @@ async def finish_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Отменяем таймер если есть
+    if update.effective_chat:
+        jobs = context.job_queue.get_jobs_by_name(f"rest_{update.effective_chat.id}")
+        for job in jobs:
+            job.schedule_removal()
+
     session_id = context.user_data.get("session_id")
     if session_id:
         await db.finish_session(session_id, "cancelled")
     if update.callback_query:
         await update.callback_query.edit_message_text(
             "❌ Тренировка отменена.\n📊 Выполненные упражнения сохранены.")
-    await send(update, context, "Вернуться на главную?",
-               reply_markup=InlineKeyboardMarkup([[
-                   InlineKeyboardButton("🏠 Главная", callback_data="go_start")
-               ]]))
+
+    # п.10 — кнопка главная в отдельном сообщении, обрабатывается через WRK_SELECT
     context.user_data.clear()
-    return ConversationHandler.END
-
-
-# ============================================================
-# ЭКСПОРТ
-# ============================================================
-
-async def export_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        await update.callback_query.answer()
-    await send(update, context,
-               "📤 Выберите формат экспорта:",
-               reply_markup=InlineKeyboardMarkup([[
-                   InlineKeyboardButton("JSON", callback_data="export_json"),
-                   InlineKeyboardButton("CSV", callback_data="export_csv"),
-               ]]))
-    return EXPORT_FORMAT
-
-
-async def export_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-    data = await db.export_user_data(user_id)
-    fmt = query.data.split("_")[1]
-
-    if fmt == "json":
-        buf = io.BytesIO(
-            json.dumps(data, ensure_ascii=False, indent=2, default=str).encode())
-        buf.name = f"training_{user_id}.json"
-        await query.message.reply_document(document=buf, filename=buf.name)
-    else:
-        out = io.StringIO()
-        writer = csv.writer(out)
-        writer.writerow(["date", "workout", "exercise", "set", "weight_kg", "reps", "new_max_kg"])
-        for sess in data.get("workout_session", []):
-            for s in (sess.get("sets") or []):
-                writer.writerow([
-                    str(sess.get("started_at", ""))[:10],
-                    sess.get("template_name", ""),
-                    s.get("exercise", ""),
-                    s.get("set", ""),
-                    s.get("weight_kg", ""),
-                    s.get("reps", ""),
-                    s.get("new_max_kg", ""),
-                ])
-        buf = io.BytesIO(out.getvalue().encode("utf-8-sig"))
-        buf.name = f"training_{user_id}.csv"
-        await query.message.reply_document(document=buf, filename=buf.name)
-
-    return ConversationHandler.END
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="Вернуться на главную?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 Главная", callback_data="go_start")
+        ]])
+    )
+    return WRK_SELECT
 
 
 # ============================================================
@@ -842,7 +1139,6 @@ def main():
         entry_points=[
             CommandHandler("start", start),
             CommandHandler("new", new_workout_start),
-            CommandHandler("export", export_start),
         ],
         states={
             CRT_NAME:                 [MessageHandler(filters.TEXT & ~filters.COMMAND, crt_name)],
@@ -851,16 +1147,37 @@ def main():
             CRT_EX_EQUIP:             [CallbackQueryHandler(crt_ex_equip, pattern="^eq_")],
             CRT_EX_EQUIP_NEW_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, crt_ex_equip_new_name)],
             CRT_EX_EQUIP_NEW_WEIGHTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, crt_ex_equip_new_weights)],
-            CRT_EX_SETS:              [MessageHandler(filters.TEXT & ~filters.COMMAND, crt_ex_sets)],
-            CRT_EX_REPS:              [MessageHandler(filters.TEXT & ~filters.COMMAND, crt_ex_reps)],
-            CRT_EX_REST:              [MessageHandler(filters.TEXT & ~filters.COMMAND, crt_ex_rest)],
-            CRT_EX_COMMENT:           [MessageHandler(filters.TEXT & ~filters.COMMAND, crt_ex_comment)],
-            CRT_EX_MORE:              [CallbackQueryHandler(crt_ex_more, pattern="^ex_")],
+            CRT_EX_SETS: [
+                CallbackQueryHandler(crt_ex_sets_btn,  pattern="^sets_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, crt_ex_sets_text),
+            ],
+            CRT_EX_REPS: [
+                CallbackQueryHandler(crt_ex_reps_btn,  pattern="^reps_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, crt_ex_reps_text),
+            ],
+            CRT_EX_REST: [
+                CallbackQueryHandler(crt_ex_rest_btn,  pattern="^rest_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, crt_ex_rest_text),
+            ],
+            CRT_EX_COMMENT: [
+                CallbackQueryHandler(crt_ex_comment_skip, pattern="^comment_skip$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, crt_ex_comment),
+            ],
+            CRT_EX_MORE: [CallbackQueryHandler(crt_ex_more, pattern="^ex_")],
+
+            EDIT_SELECT: [CallbackQueryHandler(edit_menu,   pattern="^edit_\\d+$")],
+            EDIT_MENU:   [CallbackQueryHandler(edit_action, pattern="^(edit_add_ex|edit_delete|go_start)$")],
+
             WRK_SELECT: [
                 CallbackQueryHandler(select_template,   pattern="^tmpl_"),
-                CallbackQueryHandler(new_workout_start, pattern="^new_workout$"),
-                CallbackQueryHandler(start,             pattern="^go_start$"),
-                CallbackQueryHandler(export_start,      pattern="^export$"),
+                CallbackQueryHandler(select_template,   pattern="^new_workout$"),
+                CallbackQueryHandler(select_template,   pattern="^go_start$"),
+                CallbackQueryHandler(edit_workout_list, pattern="^edit_workout$"),
+            ],
+            WRK_FIRST_WEIGHT: [
+                CallbackQueryHandler(first_weight_selected, pattern="^w_"),
+                CallbackQueryHandler(cancel_workout,        pattern="^cancel_workout$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, first_weight_selected),
             ],
             WRK_WEIGHT: [
                 CallbackQueryHandler(weight_selected,   pattern="^w_"),
@@ -874,12 +1191,10 @@ def main():
             ],
             WRK_REST: [
                 CallbackQueryHandler(skip_rest,         pattern="^skip_rest$"),
+                CallbackQueryHandler(cancel_workout,    pattern="^cancel_workout$"),
             ],
             WRK_CONFIRM_CHANGE: [
                 CallbackQueryHandler(confirm_weight_change, pattern="^wchange_"),
-            ],
-            EXPORT_FORMAT: [
-                CallbackQueryHandler(export_do,         pattern="^export_"),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],

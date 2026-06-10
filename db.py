@@ -450,6 +450,67 @@ async def delete_workout_template(template_id: int):
             "DELETE FROM workout_template WHERE id=$1", template_id
         )
 
+async def get_existing_weight(user_id: int, exercise_id: int) -> float | None:
+    """None если вес ещё не задан (первая тренировка)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT weight_kg FROM training_weight WHERE user_id=$1 AND exercise_id=$2",
+            user_id, exercise_id
+        )
+        return float(row["weight_kg"]) if row else None
+
+
+async def delete_workout_template(template_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM workout_template WHERE id=$1", template_id)
+
+
+async def delete_exercise_template(exercise_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM exercise_template WHERE id=$1", exercise_id)
+
+
+async def update_exercise_order(exercise_id: int, new_order: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE exercise_template SET order_index=$1 WHERE id=$2",
+            new_order, exercise_id
+        )
+
+
+async def swap_exercise_order(ex_id_a: int, ex_id_b: int):
+    """Меняет местами порядок двух упражнений."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row_a = await conn.fetchrow(
+            "SELECT order_index FROM exercise_template WHERE id=$1", ex_id_a)
+        row_b = await conn.fetchrow(
+            "SELECT order_index FROM exercise_template WHERE id=$1", ex_id_b)
+        if row_a and row_b:
+            await conn.execute(
+                "UPDATE exercise_template SET order_index=$1 WHERE id=$2",
+                row_b["order_index"], ex_id_a
+            )
+            await conn.execute(
+                "UPDATE exercise_template SET order_index=$1 WHERE id=$2",
+                row_a["order_index"], ex_id_b
+            )
+
+
+async def update_exercise_comment(exercise_id: int, comment: str):
+    """Обновляет комментарий упражнения — будет показан при следующей тренировке."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE exercise_template SET comment=$1 WHERE id=$2",
+            comment, exercise_id
+        )
+
+
 async def export_user_data(user_id: int) -> dict:
     """Полный экспорт данных пользователя в dict (→ JSON или CSV)."""
     pool = await get_pool()
